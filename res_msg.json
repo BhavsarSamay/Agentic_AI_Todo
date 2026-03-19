@@ -1,0 +1,102 @@
+{
+  "SUCCESS": {
+    "code": 200,
+    "message": "Operation successful"
+  },
+  "CREATED": {
+    "code": 201,
+    "message": "Resource created successfully"
+  },
+  "BAD_REQUEST": {
+    "code": 400,
+    "message": "Bad request"
+  },
+  "UNAUTHORIZED": {
+    "code": 401,
+    "message": "Unauthorized access"
+  },
+  "FORBIDDEN": {
+    "code": 403,
+    "message": "Forbidden"
+  },
+  "NOT_FOUND": {
+    "code": 404,
+    "message": "Resource not found"
+  },
+  "CONFLICT": {
+    "code": 409,
+    "message": "Resource already exists"
+  },
+  "INTERNAL_ERROR": {
+    "code": 500,
+    "message": "Internal server error"
+  },
+  "USER_CREATED": {
+    "code": 201,
+    "message": "User created successfully"
+  },
+  "USER_UPDATED": {
+    "code": 200,
+    "message": "User updated successfully"
+  },
+  "USER_DELETED": {
+    "code": 200,
+    "message": "User deleted successfully"
+  },
+  "USER_ALREADY_EXISTS": {
+    "code": 409,
+    "message": "User already exists with this email"
+  },
+  "USER_NOT_FOUND": {
+    "code": 404,
+    "message": "User not found"
+  },
+  "LOGIN_SUCCESS": {
+    "code": 200,
+    "message": "Login successful"
+  },
+  "INVALID_CREDENTIALS": {
+    "code": 401,
+    "message": "Invalid email or password"
+  },
+  "TODO_CREATED": {
+    "code": 201,
+    "message": "Todo created successfully"
+  },
+  "TODO_UPDATED": {
+    "code": 200,
+    "message": "Todo updated successfully"
+  },
+  "TODO_DELETED": {
+    "code": 200,
+    "message": "Todo deleted successfully"
+  },
+  "TODO_NOT_FOUND": {
+    "code": 404,
+    "message": "Todo not found"
+  },
+  "TODOS_RETRIEVED": {
+    "code": 200,
+    "message": "Todos retrieved successfully"
+  },
+  "INVALID_TOKEN": {
+    "code": 401,
+    "message": "Invalid or expired token"
+  },
+  "TOKEN_REQUIRED": {
+    "code": 401,
+    "message": "Token is required"
+  },
+  "VALIDATION_ERROR": {
+    "code": 400,
+    "message": "Validation error"
+  },
+  "FILE_UPLOAD_SUCCESS": {
+    "code": 200,
+    "message": "File uploaded successfully"
+  },
+  "FILE_UPLOAD_FAILED": {
+    "code": 400,
+    "message": "File upload failed"
+  }
+}
