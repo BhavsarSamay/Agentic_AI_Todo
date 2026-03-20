@@ -1,13 +1,16 @@
 require("dotenv").config();
+const lruCacheModule = require("lru-cache");
+const LRUCache = lruCacheModule.LRUCache || lruCacheModule;
 const todoService = require("../service/todoService");
 
 const TODO_CATEGORIES = ["work", "personal", "shopping", "health", "other"];
 const TODO_PRIORITIES = ["low", "medium", "high", "urgent"];
+const MAX_RETRIES = 3;
 
 const SYSTEM_PROMPT = `
 You are an AI To-Do List Assistant.
 You can manage tasks by adding, viewing, updating, and deleting them.
-0
+
 Rules:
 - Use tools for data operations whenever needed.
 - Never expose internal errors.
@@ -17,7 +20,10 @@ Rules:
 `;
 
 let langGraphModulesPromise;
-const userAgentCache = new Map();
+const userAgentCache = new LRUCache({
+  max: 500,
+  ttl: 1000 * 60 * 60 * 2,
+});
 
 const loadLangGraphModules = async () => {
   if (!langGraphModulesPromise) {
@@ -228,10 +234,163 @@ const buildAgent = async (userId) => {
     llmCalls: new ReducedValue(z.number().default(0), {
       reducer: (x, y) => x + y,
     }),
+    route: new ReducedValue(
+      z.enum(["direct", "tool", "clarify", "full"]).default("full"),
+      {
+        reducer: (_x, y) => y,
+      }
+    ),
+    retryCount: new ReducedValue(z.number().default(0), {
+      reducer: (x, y) => x + y,
+    }),
+    reflection: new ReducedValue(
+      z
+        .object({
+          isGood: z.boolean(),
+          feedback: z.string(),
+        })
+        .nullable()
+        .default(null),
+      {
+        reducer: (_x, y) => y,
+      }
+    ),
+    reflectionParseFailed: new ReducedValue(z.boolean().default(false), {
+      reducer: (_x, y) => y,
+    }),
   });
 
-  const llmCall = async (state) => {
-    const response = await modelWithTools.invoke([
+  const normalizeText = (content) => {
+    if (typeof content === "string") {
+      return content;
+    }
+
+    if (Array.isArray(content)) {
+      return content
+        .map((item) => {
+          if (typeof item === "string") return item;
+          if (item && typeof item === "object" && typeof item.text === "string") {
+            return item.text;
+          }
+          return "";
+        })
+        .filter(Boolean)
+        .join("\n");
+    }
+
+    return "";
+  };
+
+  const parseReflectionJson = (content) => {
+    const raw = normalizeText(content).trim();
+    if (!raw) return null;
+
+    try {
+      const parsed = JSON.parse(raw);
+      if (typeof parsed?.isGood !== "boolean" || typeof parsed?.feedback !== "string") {
+        return null;
+      }
+      return {
+        isGood: parsed.isGood,
+        feedback: parsed.feedback,
+      };
+    } catch (_error) {
+      return null;
+    }
+  };
+
+  const parseDecisionJson = (content) => {
+    const raw = normalizeText(content).trim();
+    if (!raw) return null;
+
+    try {
+      const parsed = JSON.parse(raw);
+      if (
+        parsed
+        && typeof parsed === "object"
+        && ["direct", "tool", "clarify", "full"].includes(parsed.route)
+      ) {
+        return parsed.route;
+      }
+      return null;
+    } catch (_error) {
+      return null;
+    }
+  };
+
+  const getLatestHumanInput = (messages) => {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message && HumanMessage.isInstance(message)) {
+        return normalizeText(message.content).trim();
+      }
+    }
+
+    return "";
+  };
+
+  const shouldSkipReflection = (content) => {
+    const text = normalizeText(content).trim();
+    if (!text) return true;
+    if (text.length <= 25) return true;
+
+    const simpleConfirmationPattern = /^(ok|okay|done|sure|got it|completed|updated|deleted|created)[.!]?$/i;
+    return simpleConfirmationPattern.test(text);
+  };
+
+  // Adaptive pre-routing node: classifies user intent into one of four execution paths.
+  const decisionNode = async (state) => {
+    const latestQuery = getLatestHumanInput(state.messages);
+
+    const normalizedQuery = latestQuery.trim();
+    const greetingPattern = /^(hi|hello|hey|thanks|thank you|ok|okay|bye)[.!?]?$/i;
+    const crudKeywordPattern = /\b(add|create|delete|remove|update|mark|complete|show|list|get)\b/i;
+
+    if (normalizedQuery.length < 15 || greetingPattern.test(normalizedQuery)) {
+      return {
+        route: "direct",
+        reflection: null,
+        reflectionParseFailed: false,
+        retryCount: 0,
+      };
+    }
+
+    if (crudKeywordPattern.test(normalizedQuery)) {
+      return {
+        route: "tool",
+        reflection: null,
+        reflectionParseFailed: false,
+        retryCount: 0,
+      };
+    }
+
+    const decisionResponse = await model.invoke([
+      new SystemMessage(
+        "You are an intent router for a TODO assistant. Classify the user request into one route and return STRICT JSON only: {\"route\": \"direct\" | \"tool\" | \"clarify\" | \"full\"}. Rules: direct for simple conversational/help responses without data operations, tool for clear CRUD/task operations, clarify when mandatory details are missing, full for complex requests requiring deeper reasoning and quality checks."
+      ),
+      new HumanMessage(`User query: ${latestQuery}`),
+    ]);
+
+    const route = parseDecisionJson(decisionResponse?.content) || "full";
+
+    return {
+      route,
+      reflection: null,
+      reflectionParseFailed: false,
+      retryCount: 0,
+    };
+  };
+
+  const routeFromDecision = (state) => {
+    if (state.route === "direct") return "directNode";
+    if (state.route === "clarify") return "clarifyNode";
+    if (state.route === "tool") return "llmCall";
+    return "llmCall";
+  };
+
+  // Simple route: answer directly with no tool execution and no reflection.
+  const directNode = async (state) => {
+    const response = await model.invoke([
       new SystemMessage(SYSTEM_PROMPT),
       ...state.messages,
     ]);
@@ -239,6 +398,52 @@ const buildAgent = async (userId) => {
     return {
       messages: [response],
       llmCalls: 1,
+    };
+  };
+
+  // Clarification route: ask one concise question for missing required details.
+  const clarifyNode = async (state) => {
+    const response = await model.invoke([
+      new SystemMessage(
+        "You are an AI To-Do assistant. Ask exactly one concise clarification question to gather missing required details before performing the request. Do not execute actions."
+      ),
+      ...state.messages,
+    ]);
+
+    return {
+      messages: [response],
+      llmCalls: 1,
+    };
+  };
+
+  const llmCall = async (state) => {
+    const reflectionFeedback = state.reflection;
+    const hasFeedback =
+      reflectionFeedback
+      && reflectionFeedback.isGood === false
+      && typeof reflectionFeedback.feedback === "string"
+      && reflectionFeedback.feedback.trim().length;
+
+    const promptMessages = [new SystemMessage(SYSTEM_PROMPT), ...state.messages];
+
+    if (hasFeedback) {
+      promptMessages.push(
+        new SystemMessage(
+          "You are revising your previous answer based on critic feedback. Improve correctness, completeness, and clarity. Keep the response concise and user-friendly."
+        ),
+        new HumanMessage(
+          `Critic feedback: ${reflectionFeedback.feedback}\n\nPlease improve your previous response accordingly.`
+        )
+      );
+    }
+
+    const response = await modelWithTools.invoke(promptMessages);
+
+    return {
+      messages: [response],
+      llmCalls: 1,
+      reflection: null,
+      reflectionParseFailed: false,
     };
   };
 
@@ -288,15 +493,86 @@ const buildAgent = async (userId) => {
       return "toolNode";
     }
 
-    return END;
+    if (state.route === "tool") {
+      return "reflectorNode";
+    }
+
+    return "reflectorNode";
+  };
+
+  const reflectorNode = async (state) => {
+    const lastMessage = state.messages.at(-1);
+
+    if (!lastMessage || !AIMessage.isInstance(lastMessage)) {
+      return {
+        reflection: { isGood: true, feedback: "No assistant output to reflect." },
+      };
+    }
+
+    if (shouldSkipReflection(lastMessage.content)) {
+      return {
+        reflection: { isGood: true, feedback: "Reflection skipped for simple response." },
+      };
+    }
+
+    const criticResponse = await model.invoke([
+      new SystemMessage(
+        "You are a strict AI critic. Evaluate the assistant's last response for correctness, completeness, and clarity. Return STRICT JSON only: {\"isGood\": true/false, \"feedback\": \"string\"}. Do not include markdown or extra text."
+      ),
+      new HumanMessage(
+        `Assistant response to evaluate:\n${normalizeText(lastMessage.content)}`
+      ),
+    ]);
+
+    const parsedReflection = parseReflectionJson(criticResponse?.content);
+
+    if (!parsedReflection) {
+      return {
+        reflection: { isGood: true, feedback: "Reflection parse failed. Ending safely." },
+        reflectionParseFailed: true,
+      };
+    }
+
+    return {
+      reflection: parsedReflection,
+      retryCount: parsedReflection.isGood ? 0 : 1,
+    };
+  };
+
+  const shouldRetry = (state) => {
+    if (state.reflectionParseFailed) {
+      return END;
+    }
+
+    if (!state.reflection || state.reflection.isGood) {
+      return END;
+    }
+
+    if (state.retryCount >= MAX_RETRIES) {
+      return END;
+    }
+
+    return "llmCall";
   };
 
   const agent = new StateGraph(MessagesState)
+    .addNode("decisionNode", decisionNode)
+    .addNode("directNode", directNode)
+    .addNode("clarifyNode", clarifyNode)
     .addNode("llmCall", llmCall)
     .addNode("toolNode", toolNode)
-    .addEdge(START, "llmCall")
-    .addConditionalEdges("llmCall", shouldContinue, ["toolNode", END])
+    .addNode("reflectorNode", reflectorNode)
+    .addEdge(START, "decisionNode")
+    .addConditionalEdges("decisionNode", routeFromDecision, [
+      "directNode",
+      "clarifyNode",
+      "llmCall",
+    ])
+    .addEdge("directNode", END)
+    .addEdge("clarifyNode", END)
+    .addConditionalEdges("llmCall", shouldContinue, ["toolNode", "reflectorNode", END])
     .addEdge("toolNode", "llmCall")
+    .addConditionalEdges("reflectorNode", shouldRetry, ["llmCall", END])
     .compile({ checkpointer: new MemorySaver() });
 
   return {

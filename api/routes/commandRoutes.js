@@ -77,4 +77,44 @@ router.post(
 	commandController.executeLangGraphCommand
 );
 
+
+
+/**
+ * @swagger
+ * /api/v1/agent/command/langgraphwithreflexion:
+ *   post:
+ *     summary: Execute natural language todo commands using LangGraph
+ *     description: Runs the todo command workflow using a LangGraph-based agent with tool-calling.
+ *     tags:
+ *       - Agent
+ *     security:
+ *       - userAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - command
+ *             properties:
+ *               command:
+ *                 type: string
+ *                 example: create a todo to prepare project report by friday with high priority
+ *     responses:
+ *       200:
+ *         description: Command executed successfully
+ *       400:
+ *         description: Invalid or missing command
+ *       401:
+ *         description: Unauthorized
+ *       500:
+ *         description: Internal server error
+ */
+router.post(
+	"/command/langgraphwithreflexion",
+	authMiddleware.verifyAuth,
+	commandController.executeLangGraphCommandwithReflexion
+);
+
 module.exports = router;
