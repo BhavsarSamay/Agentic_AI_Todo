@@ -35,12 +35,21 @@ const summarizeOlderMessages = (messages = [], keepRecent = 12) => {
   return `Conversation summary (older context):\n${lines.join("\n")}`;
 };
 
-const selectContextMessages = ({ messages = [], HumanMessage, AIMessage, ToolMessage, maxMessages = 12 }) => {
+const selectContextMessages = ({
+  messages = [],
+  HumanMessage,
+  AIMessage,
+  ToolMessage,
+  SystemMessage,
+  maxMessages = 12,
+}) => {
   if (!Array.isArray(messages) || !messages.length) {
     return [];
   }
 
-  const recent = messages.slice(-maxMessages);
+  const recent = messages
+    .slice(-maxMessages)
+    .filter((message) => !(SystemMessage && message instanceof SystemMessage));
 
   let lastUser = null;
   let lastAssistant = null;
@@ -48,6 +57,7 @@ const selectContextMessages = ({ messages = [], HumanMessage, AIMessage, ToolMes
 
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
+    if (SystemMessage && message instanceof SystemMessage) continue;
     if (!lastUser && HumanMessage.isInstance(message)) lastUser = message;
     if (!lastAssistant && AIMessage.isInstance(message)) lastAssistant = message;
     if (!lastTool && ToolMessage.isInstance(message)) lastTool = message;

@@ -246,3 +246,5 @@ exports.runAgent = async (userMessage, userId) => {
   // OpenAI client not configured
   return runAgentFallback(userMessage);
 };
+
+exports.executeTool = executeTool;

@@ -22,6 +22,55 @@ class MongoCheckpointer {
     this._fallbackWrites = new LRUCache({ max: options.maxFallback || FALLBACK_CACHE_MAX });
   }
 
+  _isSystemMessageLike(message) {
+    if (!message) return false;
+
+    if (typeof message._getType === "function") {
+      return message._getType() === "system";
+    }
+
+    if (typeof message.type === "string" && message.type.toLowerCase() === "system") {
+      return true;
+    }
+
+    if (Array.isArray(message.id) && message.id.some((part) => String(part).includes("SystemMessage"))) {
+      return true;
+    }
+
+    if (message.kwargs && typeof message.kwargs === "object") {
+      if (typeof message.kwargs.type === "string" && message.kwargs.type.toLowerCase() === "system") {
+        return true;
+      }
+      if (Array.isArray(message.kwargs.id) && message.kwargs.id.some((part) => String(part).includes("SystemMessage"))) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  _sanitizeMessagesArray(messages) {
+    if (!Array.isArray(messages)) return messages;
+    return messages.filter((message) => !this._isSystemMessageLike(message));
+  }
+
+  _sanitizeCheckpoint(checkpoint) {
+    if (!checkpoint || typeof checkpoint !== "object") {
+      return checkpoint;
+    }
+
+    const sanitized = { ...checkpoint };
+
+    if (sanitized.channel_values && typeof sanitized.channel_values === "object") {
+      sanitized.channel_values = { ...sanitized.channel_values };
+      if (Array.isArray(sanitized.channel_values.messages)) {
+        sanitized.channel_values.messages = this._sanitizeMessagesArray(sanitized.channel_values.messages);
+      }
+    }
+
+    return sanitized;
+  }
+
   _key(userId, threadId, checkpointNs, checkpointId) {
     return JSON.stringify([String(userId), String(threadId), String(checkpointNs || ""), String(checkpointId)]);
   }
@@ -65,7 +114,14 @@ class MongoCheckpointer {
   }
 
   _toPendingWriteDocs(writes = [], taskId) {
-    return writes.map(([channel, value], idx) => {
+    const sanitizedWrites = writes.map(([channel, value]) => {
+      if (channel === "messages" && Array.isArray(value)) {
+        return [channel, this._sanitizeMessagesArray(value)];
+      }
+      return [channel, value];
+    });
+
+    return sanitizedWrites.map(([channel, value], idx) => {
       const writeIdx = WRITES_IDX_MAP[channel] ?? idx;
       return {
         write_key: `${String(taskId)}:${String(writeIdx)}`,
@@ -327,7 +383,7 @@ class MongoCheckpointer {
   }
 
   async put(config, checkpoint, metadata = {}, _newVersions = {}) {
-    const normalizedCheckpoint = copyCheckpoint(checkpoint);
+    const normalizedCheckpoint = this._sanitizeCheckpoint(copyCheckpoint(checkpoint));
     const { userId, threadId, checkpointNs } = this._resolveIdsFromConfig(config);
 
     if (!userId || !threadId) {

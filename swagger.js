@@ -188,6 +188,8 @@ const options = {
     "./api/routes/userRoutes.js",
     "./api/routes/todoRoutes.js",
     "./api/routes/commandRoutes.js",
+    "./api/routes/aiAgentOptimal.js",
+
   ],
 };
 

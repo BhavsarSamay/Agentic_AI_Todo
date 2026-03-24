@@ -1,8 +1,11 @@
 require("dotenv").config();
 const todoService = require("../service/todoService");
+const MongoCheckpointer = require("../checkpointer/mongoCheckpointer");
+const { selectContextMessages } = require("./contextSelector");
 
 const TODO_CATEGORIES = ["work", "personal", "shopping", "health", "other"];
 const TODO_PRIORITIES = ["low", "medium", "high", "urgent"];
+const MAX_MESSAGES = 6;
 
 const SYSTEM_PROMPT = `
 You are an AI To-Do List Assistant.
@@ -18,6 +21,7 @@ Rules:
 
 let langGraphModulesPromise;
 const userAgentCache = new Map();
+const globalCheckpointer = new MongoCheckpointer();
 
 const sanitizeMessagesForGemini = (messages = [], SystemMessage) => {
   return (Array.isArray(messages) ? messages : []).filter((msg) => !(msg instanceof SystemMessage));
@@ -38,21 +42,20 @@ const loadLangGraphModules = async () => {
     langGraphModulesPromise = Promise.all([
       import("@langchain/core/tools"),
       import("@langchain/core/messages"),
-      import("@langchain/openai"),
+      import("@langchain/google-genai"),
       import("@langchain/langgraph"),
       import("zod"),
-    ]).then(([toolsMod, messagesMod, openaiMod, langgraphMod, zodMod]) => ({
+    ]).then(([toolsMod, messagesMod, googleMod, langgraphMod, zodMod]) => ({
       tool: toolsMod.tool,
       HumanMessage: messagesMod.HumanMessage,
       SystemMessage: messagesMod.SystemMessage,
       AIMessage: messagesMod.AIMessage,
       ToolMessage: messagesMod.ToolMessage,
-      ChatOpenAI: openaiMod.ChatOpenAI,
+      ChatGoogleGenerativeAI: googleMod.ChatGoogleGenerativeAI,
       StateGraph: langgraphMod.StateGraph,
       StateSchema: langgraphMod.StateSchema,
       MessagesValue: langgraphMod.MessagesValue,
       ReducedValue: langgraphMod.ReducedValue,
-      MemorySaver: langgraphMod.MemorySaver,
       START: langgraphMod.START,
       END: langgraphMod.END,
       z: zodMod.z,
@@ -118,30 +121,29 @@ const buildAgent = async (userId) => {
     SystemMessage,
     AIMessage,
     ToolMessage,
-    ChatOpenAI,
+    ChatGoogleGenerativeAI,
     StateGraph,
     StateSchema,
     MessagesValue,
     ReducedValue,
-    MemorySaver,
     START,
     END,
     z,
   } = await loadLangGraphModules();
 
-  if (!process.env.OPENAI_API_KEY) {
+  if (!process.env.GEMINI_API_KEY) {
     return {
       run: async () => ({
         output:
-          "I'm currently offline. Please configure OPENAI_API_KEY to use the AI assistant.",
-        trace: [{ type: "output", output: "OpenAI unavailable." }],
+          "I'm currently offline. Please configure GEMINI_API_KEY to use the AI assistant.",
+        trace: [{ type: "output", output: "Gemini unavailable." }],
       }),
     };
   }
 
-  const model = new ChatOpenAI({
-    apiKey: process.env.OPENAI_API_KEY,
-    modelName: "gpt-4o",
+  const model = new ChatGoogleGenerativeAI({
+    apiKey: process.env.GEMINI_API_KEY,
+    model: process.env.GEMINI_MODEL || "models/gemini-2.5-flash",
     temperature: 0,
   });
 
@@ -253,7 +255,16 @@ const buildAgent = async (userId) => {
    * @returns {Object} Updated message history with new AIMessage and llmCalls incremented
    */
   const llmCall = async (state) => {
-    const response = await safeInvoke(modelWithTools, state.messages, SYSTEM_PROMPT, SystemMessage);
+    const selectedMessages = selectContextMessages({
+      messages: state.messages,
+      HumanMessage,
+      AIMessage,
+      ToolMessage,
+      SystemMessage,
+      maxMessages: MAX_MESSAGES,
+    });
+
+    const response = await safeInvoke(modelWithTools, selectedMessages, SYSTEM_PROMPT, SystemMessage);
 
     return {
       messages: [response],
@@ -337,7 +348,7 @@ const buildAgent = async (userId) => {
     .addEdge(START, "llmCall")
     .addConditionalEdges("llmCall", shouldContinue, ["toolNode", END])
     .addEdge("toolNode", "llmCall")
-    .compile({ checkpointer: new MemorySaver() });
+    .compile({ checkpointer: globalCheckpointer });
 
   return {
     run: async (command, options = {}) => {
@@ -360,13 +371,14 @@ const buildAgent = async (userId) => {
           },
           {
             configurable: {
-              thread_id: threadIdToUse,
+              thread_id: String(threadIdToUse),
+              user_id: String(userId),
             },
             runName: "todo-ai-langgraph-agent",
             tags: ["todo-ai", "langgraph", "agent-command"],
             metadata: {
               userId: String(userId),
-              threadId: threadIdToUse,
+              threadId: String(threadIdToUse),
               endpoint: "/api/v1/agent/command/langgraph",
             },
           }

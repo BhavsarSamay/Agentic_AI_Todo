@@ -40,3 +40,5 @@ build/
 # Variables
 .pem
 *.pem
+
+package-lock.json

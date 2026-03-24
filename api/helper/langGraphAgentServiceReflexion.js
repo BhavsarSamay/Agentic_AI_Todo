@@ -51,16 +51,18 @@ const loadLangGraphModules = async () => {
     langGraphModulesPromise = Promise.all([
       import("@langchain/core/tools"),
       import("@langchain/core/messages"),
-      import("@langchain/openai"),
+      // import("@langchain/openai"),
+      import("@langchain/google-genai"),
       import("@langchain/langgraph"),
       import("zod"),
-    ]).then(([toolsMod, messagesMod, openaiMod, langgraphMod, zodMod]) => ({
+    ]).then(([toolsMod, messagesMod, googleMod, langgraphMod, zodMod]) => ({
       tool: toolsMod.tool,
       HumanMessage: messagesMod.HumanMessage,
       SystemMessage: messagesMod.SystemMessage,
       AIMessage: messagesMod.AIMessage,
       ToolMessage: messagesMod.ToolMessage,
-      ChatOpenAI: openaiMod.ChatOpenAI,
+      // ChatOpenAI: openaiMod.ChatOpenAI,
+      ChatGoogleGenerativeAI: googleMod.ChatGoogleGenerativeAI,
       StateGraph: langgraphMod.StateGraph,
       StateSchema: langgraphMod.StateSchema,
       MessagesValue: langgraphMod.MessagesValue,
@@ -95,6 +97,20 @@ const withSafeFallback = async (fn, fallbackValue, logPayload = {}) => {
     logger.error({ error: error?.message || error, ...logPayload }, "Agent operation failed");
     return fallbackValue;
   }
+};
+
+const sanitizeMessagesForGemini = (messages = [], SystemMessage) => {
+  return (Array.isArray(messages) ? messages : []).filter((msg) => !(msg instanceof SystemMessage));
+};
+
+const safeInvoke = async (model, messages, systemPrompt, SystemMessage) => {
+  const cleanedMessages = sanitizeMessagesForGemini(messages, SystemMessage);
+  console.log(cleanedMessages.map((m) => (m && typeof m._getType === "function" ? m._getType() : typeof m)));
+
+  return model.invoke([
+    new SystemMessage(systemPrompt),
+    ...cleanedMessages,
+  ]);
 };
 
 const executeTool = async (functionName, input = {}, userId, trace) => {
@@ -179,7 +195,7 @@ const buildAgent = async (userId) => {
     SystemMessage,
     AIMessage,
     ToolMessage,
-    ChatOpenAI,
+    ChatGoogleGenerativeAI,
     StateGraph,
     StateSchema,
     MessagesValue,
@@ -189,21 +205,27 @@ const buildAgent = async (userId) => {
     z,
   } = await loadLangGraphModules();
 
-  if (!process.env.OPENAI_API_KEY) {
+  // if (!process.env.OPENAI_API_KEY) {
+  if (!process.env.GEMINI_API_KEY){
     return {
       run: async () => ({
         output:
-          "I'm currently offline. Please configure OPENAI_API_KEY to use the AI assistant.",
-        trace: [{ type: "output", output: "OpenAI unavailable." }],
+          "I'm currently offline. Please configure GEMINI_API_KEY to use the AI assistant.",
+        trace: [{ type: "output", output: "Gemini unavailable." }],
       }),
     };
   }
 
-  const model = new ChatOpenAI({
-    apiKey: process.env.OPENAI_API_KEY,
-    modelName: "gpt-4o",
-    temperature: 0,
-  });
+  // const model = new ChatOpenAI({
+  //   apiKey: process.env.OPENAI_API_KEY,
+  //   modelName: "gpt-4o",
+  //   temperature: 0,
+  // });
+    const model = new ChatGoogleGenerativeAI({
+      apiKey: process.env.GEMINI_API_KEY,
+      model: "models/gemini-2.5-flash", // or gemini-1.5-flash
+      temperature: 0, 
+    });
 
   const getAllTodosTool = tool(
     async () => executeTool("getAllTodos", {}, userId, {}),
@@ -422,12 +444,12 @@ const buildAgent = async (userId) => {
     }
 
     const decisionResponse = await withRetry(
-      () => model.invoke([
-        new SystemMessage(
-          "Classify user intent for a TODO assistant. Return STRICT JSON only: {\"route\": \"direct\" | \"tool\" | \"clarify\" | \"full\"}. direct: simple conversation/help, tool: concrete CRUD action possible now, clarify: missing required details, full: complex reasoning task."
-        ),
-        new HumanMessage(`User query: ${latestQuery}`),
-      ]),
+      () => safeInvoke(
+        model,
+        [new HumanMessage(`User query: ${latestQuery}`)],
+        "Classify user intent for a TODO assistant. Return STRICT JSON only: {\"route\": \"direct\" | \"tool\" | \"clarify\" | \"full\"}. direct: simple conversation/help, tool: concrete CRUD action possible now, clarify: missing required details, full: complex reasoning task.",
+        SystemMessage
+      ),
       2
     );
 
@@ -459,7 +481,7 @@ const buildAgent = async (userId) => {
    */
   const directNode = async (state) => {
     const response = await withRetry(
-      () => model.invoke([new SystemMessage(SYSTEM_PROMPT), ...state.messages]),
+      () => safeInvoke(model, state.messages, SYSTEM_PROMPT, SystemMessage),
       2
     );
 
@@ -476,12 +498,12 @@ const buildAgent = async (userId) => {
    */
   const clarifyNode = async (state) => {
     const response = await withRetry(
-      () => model.invoke([
-        new SystemMessage(
-          "Ask exactly one concise clarification question to gather missing required details before performing the request."
-        ),
-        ...state.messages,
-      ]),
+      () => safeInvoke(
+        model,
+        state.messages,
+        "Ask exactly one concise clarification question to gather missing required details before performing the request.",
+        SystemMessage
+      ),
       2
     );
 
@@ -510,27 +532,30 @@ const buildAgent = async (userId) => {
       HumanMessage,
       AIMessage,
       ToolMessage,
+      SystemMessage,
       maxMessages: MAX_MESSAGES,
     });
 
     const summary = summarizeOlderMessages(state.messages, MAX_MESSAGES);
 
-    const promptMessages = [new SystemMessage(SYSTEM_PROMPT)];
+    const promptMessages = sanitizeMessagesForGemini(selectedMessages, SystemMessage);
     if (summary) {
-      promptMessages.push(new SystemMessage(summary));
+      promptMessages.push(new HumanMessage(summary));
     }
-    promptMessages.push(...selectedMessages);
 
     if (hasFeedback) {
       promptMessages.push(
-        new SystemMessage(
+        new HumanMessage(
           "Revise your previous answer using critic feedback. Improve correctness and keep it concise."
         ),
         new HumanMessage(`Critic feedback: ${reflectionFeedback.feedback}`)
       );
     }
 
-    const response = await withRetry(() => modelWithTools.invoke(promptMessages), 2);
+    const response = await withRetry(
+      () => safeInvoke(modelWithTools, promptMessages, SYSTEM_PROMPT, SystemMessage),
+      2
+    );
 
     return {
       messages: [response],
@@ -651,12 +676,12 @@ const buildAgent = async (userId) => {
     }
 
     const criticResponse = await withRetry(
-      () => model.invoke([
-        new SystemMessage(
-          "You are a strict AI critic. Return STRICT JSON only: {\"isGood\": true/false, \"feedback\": \"string\"}."
-        ),
-        new HumanMessage(`Assistant response to evaluate:\n${normalizeText(lastMessage.content)}`),
-      ]),
+      () => safeInvoke(
+        model,
+        [new HumanMessage(`Assistant response to evaluate:\n${normalizeText(lastMessage.content)}`)],
+        "You are a strict AI critic. Return STRICT JSON only: {\"isGood\": true/false, \"feedback\": \"string\"}.",
+        SystemMessage
+      ),
       2
     );
 

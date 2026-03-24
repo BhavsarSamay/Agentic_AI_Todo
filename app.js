@@ -37,6 +37,7 @@ app.use(
 const userRoutes = require("./api/routes/userRoutes");
 const todoRoutes = require("./api/routes/todoRoutes");
 const commandRoutes = require("./api/routes/commandRoutes");
+const aiAgentOptimalRoutes = require("./api/routes/aiAgentOptimal");
 
 // Middleware
 app.use(cors());
@@ -60,6 +61,7 @@ app.use((req, res, next) => {
 app.use("/api/v1/user", userRoutes);
 app.use("/api/v1/todo", todoRoutes);
 app.use("/api/v1/agent", commandRoutes);
+app.use("/api/v1/ai-agent-optimal", aiAgentOptimalRoutes);
 
 // Health check endpoint
 app.get("/health", (req, res) => {
