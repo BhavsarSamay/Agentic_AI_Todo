@@ -73,12 +73,12 @@ exports.executeLangGraphCommandwithReflexion = async (req, res) => {
   try {
     const { command } = req.body;
 
-    if (!command || typeof command !== "string" || !command.trim()) {
-      return res.status(400).json({
-        success: false,
-        message: "Command is required",
-      });
-    }
+    // if (!command || typeof command !== "string" || !command.trim()) {
+    //   return res.status(400).json({
+    //     success: false,
+    //     message: "Command is required",
+    //   });
+    // }
 
     const result = await langGraphAgentServiceReflexion.runLangGraphAgent(
       command.trim(),

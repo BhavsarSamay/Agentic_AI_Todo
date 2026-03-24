@@ -230,6 +230,7 @@ const buildAgent = async (userId) => {
     }),
   });
 
+  // Node to prompt the LLM to process messages and return the next response
   const llmCall = async (state) => {
     const response = await modelWithTools.invoke([
       new SystemMessage(SYSTEM_PROMPT),
@@ -242,6 +243,7 @@ const buildAgent = async (userId) => {
     };
   };
 
+  // Node to safely execute user requested tools and return results mapped to tool context
   const toolNode = async (state) => {
     const lastMessage = state.messages.at(-1);
 
@@ -277,6 +279,7 @@ const buildAgent = async (userId) => {
     return { messages: result };
   };
 
+  // Edge condition that determines if we need to call tool-node or end flow
   const shouldContinue = (state) => {
     const lastMessage = state.messages.at(-1);
 
@@ -291,6 +294,7 @@ const buildAgent = async (userId) => {
     return END;
   };
 
+  // Compiling the LangGraph StateMachine describing how different nodes connect via edges
   const agent = new StateGraph(MessagesState)
     .addNode("llmCall", llmCall)
     .addNode("toolNode", toolNode)

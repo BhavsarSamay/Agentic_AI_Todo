@@ -1,11 +1,20 @@
 require("dotenv").config();
+const { randomUUID } = require("crypto");
 const lruCacheModule = require("lru-cache");
 const LRUCache = lruCacheModule.LRUCache || lruCacheModule;
 const todoService = require("../service/todoService");
+const chatHistoryService = require("../service/chatHistoryService");
+const logger = require("./logger");
+const MongoCheckpointer = require("../checkpointer/mongoCheckpointer");
+const ToolCache = require("./toolCache");
+const { formatToolResult } = require("./toolResponseFormatter");
+const { summarizeOlderMessages, selectContextMessages } = require("./contextSelector");
 
 const TODO_CATEGORIES = ["work", "personal", "shopping", "health", "other"];
 const TODO_PRIORITIES = ["low", "medium", "high", "urgent"];
 const MAX_RETRIES = 3;
+const MAX_MESSAGES = 10;
+const TOOL_CACHE_TTL_MS = 1000 * 30;
 
 const SYSTEM_PROMPT = `
 You are an AI To-Do List Assistant.
@@ -16,14 +25,26 @@ Rules:
 - Never expose internal errors.
 - Keep responses short, clear, and user-friendly.
 - If a request is ambiguous, ask a concise clarification question.
+- Ask for confirmation before destructive actions like delete.
 - Current Date: ${new Date().toISOString()}
 `;
 
 let langGraphModulesPromise;
 const userAgentCache = new LRUCache({
-  max: 500,
+  max: 1000,
   ttl: 1000 * 60 * 60 * 2,
 });
+const toolCache = new ToolCache({ max: 3000, ttl: TOOL_CACHE_TTL_MS });
+const globalCheckpointer = new MongoCheckpointer();
+
+const resolveThreadId = (userId, options = {}) => {
+  const rawSessionId = options.sessionId || options.threadId || "default";
+  const effectiveSessionId = options.resetMemory
+    ? `${String(rawSessionId)}:${Date.now()}`
+    : String(rawSessionId);
+
+  return `${String(userId)}:${effectiveSessionId}`;
+};
 
 const loadLangGraphModules = async () => {
   if (!langGraphModulesPromise) {
@@ -44,7 +65,6 @@ const loadLangGraphModules = async () => {
       StateSchema: langgraphMod.StateSchema,
       MessagesValue: langgraphMod.MessagesValue,
       ReducedValue: langgraphMod.ReducedValue,
-      MemorySaver: langgraphMod.MemorySaver,
       START: langgraphMod.START,
       END: langgraphMod.END,
       z: zodMod.z,
@@ -54,46 +74,89 @@ const loadLangGraphModules = async () => {
   return langGraphModulesPromise;
 };
 
-const executeTool = async (functionName, input = {}, userId) => {
+const withRetry = async (fn, retries = 2) => {
+  let lastError;
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      if (attempt === retries) break;
+      await new Promise((resolve) => setTimeout(resolve, 150 * (attempt + 1)));
+    }
+  }
+  throw lastError;
+};
+
+const withSafeFallback = async (fn, fallbackValue, logPayload = {}) => {
+  try {
+    return await fn();
+  } catch (error) {
+    logger.error({ error: error?.message || error, ...logPayload }, "Agent operation failed");
+    return fallbackValue;
+  }
+};
+
+const executeTool = async (functionName, input = {}, userId, trace) => {
+  const cacheKeyPayload = { userId, toolName: functionName, input };
+
+  const isReadTool = functionName === "getAllTodos" || functionName === "getTodoById";
+  if (isReadTool) {
+    const cached = toolCache.get(cacheKeyPayload);
+    if (cached !== undefined) {
+      logger.debug({ traceId: trace.traceId, functionName }, "Tool cache hit");
+      return cached;
+    }
+  }
+
+  let response;
+
   switch (functionName) {
     case "getAllTodos": {
-      const todos = await todoService.getAllTodos(userId);
-      return todos;
+      response = await todoService.getAllTodos(userId);
+      break;
     }
 
     case "getTodoById": {
       if (!input.id) throw new Error("getTodoById requires an id.");
-      const todo = await todoService.getTodoById(userId, input.id);
-      if (!todo) throw new Error(`Todo with id '${input.id}' not found.`);
-      return todo;
+      response = await todoService.getTodoById(userId, input.id);
+      if (!response) throw new Error(`Todo with id '${input.id}' not found.`);
+      break;
     }
 
     case "createTodo": {
       if (!input.title) throw new Error("createTodo requires a title.");
-      const todo = await todoService.createTodo(userId, {
+      response = await todoService.createTodo(userId, {
         title: input.title,
         description: input.description || null,
         category: TODO_CATEGORIES.includes(input.category) ? input.category : "personal",
         priority: TODO_PRIORITIES.includes(input.priority) ? input.priority : "medium",
         dueDate: input.dueDate ? new Date(input.dueDate) : null,
       });
-      return todo;
+      toolCache.clearUser(userId);
+      break;
     }
 
     case "updateTodo": {
       if (!input.id) throw new Error("updateTodo requires an id.");
       const updates = input.updates || {};
       if (updates.status === "completed") updates.completedDate = new Date();
-      const todo = await todoService.updateTodo(userId, input.id, updates);
-      if (!todo) throw new Error(`Todo with id '${input.id}' not found.`);
-      return todo;
+      response = await todoService.updateTodo(userId, input.id, updates);
+      if (!response) throw new Error(`Todo with id '${input.id}' not found.`);
+      toolCache.clearUser(userId);
+      break;
     }
 
     case "deleteTodo": {
       if (!input.id) throw new Error("deleteTodo requires an id.");
-      const todo = await todoService.deleteTodo(userId, input.id);
-      if (!todo) throw new Error(`Todo with id '${input.id}' not found.`);
-      return { deleted: true, id: input.id, title: todo.title };
+      if (input.confirm !== true) {
+        throw new Error("Delete requires confirmation. Ask the user to confirm and then call deleteTodo with confirm=true.");
+      }
+      const deleted = await todoService.deleteTodo(userId, input.id);
+      if (!deleted) throw new Error(`Todo with id '${input.id}' not found.`);
+      response = { deleted: true, id: input.id, title: deleted.title };
+      toolCache.clearUser(userId);
+      break;
     }
 
     default:
@@ -101,6 +164,12 @@ const executeTool = async (functionName, input = {}, userId) => {
         `Unknown tool: '${functionName}'. Available tools: getAllTodos, getTodoById, createTodo, updateTodo, deleteTodo.`
       );
   }
+
+  if (isReadTool) {
+    toolCache.set(cacheKeyPayload, response);
+  }
+
+  return response;
 };
 
 const buildAgent = async (userId) => {
@@ -115,7 +184,6 @@ const buildAgent = async (userId) => {
     StateSchema,
     MessagesValue,
     ReducedValue,
-    MemorySaver,
     START,
     END,
     z,
@@ -138,7 +206,7 @@ const buildAgent = async (userId) => {
   });
 
   const getAllTodosTool = tool(
-    async () => executeTool("getAllTodos", {}, userId),
+    async () => executeTool("getAllTodos", {}, userId, {}),
     {
       name: "getAllTodos",
       description: "Retrieve all todos for the authenticated user",
@@ -147,7 +215,7 @@ const buildAgent = async (userId) => {
   );
 
   const getTodoByIdTool = tool(
-    async ({ id }) => executeTool("getTodoById", { id }, userId),
+    async ({ id }) => executeTool("getTodoById", { id }, userId, {}),
     {
       name: "getTodoById",
       description: "Get a specific todo by id",
@@ -159,11 +227,7 @@ const buildAgent = async (userId) => {
 
   const createTodoTool = tool(
     async ({ title, description, category, priority, dueDate }) =>
-      executeTool(
-        "createTodo",
-        { title, description, category, priority, dueDate },
-        userId
-      ),
+      executeTool("createTodo", { title, description, category, priority, dueDate }, userId, {}),
     {
       name: "createTodo",
       description: "Create a new todo",
@@ -181,7 +245,7 @@ const buildAgent = async (userId) => {
   );
 
   const updateTodoTool = tool(
-    async ({ id, updates }) => executeTool("updateTodo", { id, updates }, userId),
+    async ({ id, updates }) => executeTool("updateTodo", { id, updates }, userId, {}),
     {
       name: "updateTodo",
       description: "Update an existing todo by id",
@@ -191,9 +255,7 @@ const buildAgent = async (userId) => {
           .object({
             title: z.string().optional(),
             description: z.string().nullable().optional(),
-            category: z
-              .enum(["work", "personal", "shopping", "health", "other"])
-              .optional(),
+            category: z.enum(["work", "personal", "shopping", "health", "other"]).optional(),
             priority: z.enum(["low", "medium", "high", "urgent"]).optional(),
             status: z.enum(["pending", "in-progress", "completed", "archived"]).optional(),
             dueDate: z.string().nullable().optional(),
@@ -208,12 +270,13 @@ const buildAgent = async (userId) => {
   );
 
   const deleteTodoTool = tool(
-    async ({ id }) => executeTool("deleteTodo", { id }, userId),
+    async ({ id, confirm }) => executeTool("deleteTodo", { id, confirm }, userId, {}),
     {
       name: "deleteTodo",
-      description: "Delete a todo by id",
+      description: "Delete a todo by id. Requires confirm=true.",
       schema: z.object({
         id: z.string().describe("Todo id"),
+        confirm: z.boolean().optional(),
       }),
     }
   );
@@ -236,12 +299,10 @@ const buildAgent = async (userId) => {
     }),
     route: new ReducedValue(
       z.enum(["direct", "tool", "clarify", "full"]).default("full"),
-      {
-        reducer: (_x, y) => y,
-      }
+      { reducer: (_x, y) => y }
     ),
     retryCount: new ReducedValue(z.number().default(0), {
-      reducer: (x, y) => x + y,
+      reducer: (_x, y) => y,
     }),
     reflection: new ReducedValue(
       z
@@ -251,20 +312,21 @@ const buildAgent = async (userId) => {
         })
         .nullable()
         .default(null),
-      {
-        reducer: (_x, y) => y,
-      }
+      { reducer: (_x, y) => y }
     ),
     reflectionParseFailed: new ReducedValue(z.boolean().default(false), {
+      reducer: (_x, y) => y,
+    }),
+    toolOutputText: new ReducedValue(z.string().default(""), {
+      reducer: (_x, y) => y,
+    }),
+    stopAfterTool: new ReducedValue(z.boolean().default(false), {
       reducer: (_x, y) => y,
     }),
   });
 
   const normalizeText = (content) => {
-    if (typeof content === "string") {
-      return content;
-    }
-
+    if (typeof content === "string") return content;
     if (Array.isArray(content)) {
       return content
         .map((item) => {
@@ -277,7 +339,6 @@ const buildAgent = async (userId) => {
         .filter(Boolean)
         .join("\n");
     }
-
     return "";
   };
 
@@ -290,10 +351,7 @@ const buildAgent = async (userId) => {
       if (typeof parsed?.isGood !== "boolean" || typeof parsed?.feedback !== "string") {
         return null;
       }
-      return {
-        isGood: parsed.isGood,
-        feedback: parsed.feedback,
-      };
+      return parsed;
     } catch (_error) {
       return null;
     }
@@ -305,11 +363,7 @@ const buildAgent = async (userId) => {
 
     try {
       const parsed = JSON.parse(raw);
-      if (
-        parsed
-        && typeof parsed === "object"
-        && ["direct", "tool", "clarify", "full"].includes(parsed.route)
-      ) {
+      if (parsed && ["direct", "tool", "clarify", "full"].includes(parsed.route)) {
         return parsed.route;
       }
       return null;
@@ -325,7 +379,6 @@ const buildAgent = async (userId) => {
         return normalizeText(message.content).trim();
       }
     }
-
     return "";
   };
 
@@ -333,20 +386,24 @@ const buildAgent = async (userId) => {
     const text = normalizeText(content).trim();
     if (!text) return true;
     if (text.length <= 25) return true;
-
-    const simpleConfirmationPattern = /^(ok|okay|done|sure|got it|completed|updated|deleted|created)[.!]?$/i;
-    return simpleConfirmationPattern.test(text);
+    return /^(ok|okay|done|sure|got it|completed|updated|deleted|created)[.!]?$/i.test(text);
   };
 
-  // Adaptive pre-routing node: classifies user intent into one of four execution paths.
+  // Evaluates user intent to route them appropriately without invoking the full model.
   const decisionNode = async (state) => {
     const latestQuery = getLatestHumanInput(state.messages);
-
     const normalizedQuery = latestQuery.trim();
-    const greetingPattern = /^(hi|hello|hey|thanks|thank you|ok|okay|bye)[.!?]?$/i;
-    const crudKeywordPattern = /\b(add|create|delete|remove|update|mark|complete|show|list|get)\b/i;
 
-    if (normalizedQuery.length < 15 || greetingPattern.test(normalizedQuery)) {
+    if (!normalizedQuery) {
+      return {
+        route: "clarify",
+        reflection: null,
+        reflectionParseFailed: false,
+        retryCount: 0,
+      };
+    }
+
+    if (/^(hi|hello|hey|thanks|thank you|bye)[.!?]?$/i.test(normalizedQuery)) {
       return {
         route: "direct",
         reflection: null,
@@ -355,21 +412,15 @@ const buildAgent = async (userId) => {
       };
     }
 
-    if (crudKeywordPattern.test(normalizedQuery)) {
-      return {
-        route: "tool",
-        reflection: null,
-        reflectionParseFailed: false,
-        retryCount: 0,
-      };
-    }
-
-    const decisionResponse = await model.invoke([
-      new SystemMessage(
-        "You are an intent router for a TODO assistant. Classify the user request into one route and return STRICT JSON only: {\"route\": \"direct\" | \"tool\" | \"clarify\" | \"full\"}. Rules: direct for simple conversational/help responses without data operations, tool for clear CRUD/task operations, clarify when mandatory details are missing, full for complex requests requiring deeper reasoning and quality checks."
-      ),
-      new HumanMessage(`User query: ${latestQuery}`),
-    ]);
+    const decisionResponse = await withRetry(
+      () => model.invoke([
+        new SystemMessage(
+          "Classify user intent for a TODO assistant. Return STRICT JSON only: {\"route\": \"direct\" | \"tool\" | \"clarify\" | \"full\"}. direct: simple conversation/help, tool: concrete CRUD action possible now, clarify: missing required details, full: complex reasoning task."
+        ),
+        new HumanMessage(`User query: ${latestQuery}`),
+      ]),
+      2
+    );
 
     const route = parseDecisionJson(decisionResponse?.content) || "full";
 
@@ -378,44 +429,43 @@ const buildAgent = async (userId) => {
       reflection: null,
       reflectionParseFailed: false,
       retryCount: 0,
+      stopAfterTool: false,
+      toolOutputText: "",
     };
   };
 
   const routeFromDecision = (state) => {
     if (state.route === "direct") return "directNode";
     if (state.route === "clarify") return "clarifyNode";
-    if (state.route === "tool") return "llmCall";
     return "llmCall";
   };
 
-  // Simple route: answer directly with no tool execution and no reflection.
+  // Provides a fast direct response for simple conversational queries without specific tools.
   const directNode = async (state) => {
-    const response = await model.invoke([
-      new SystemMessage(SYSTEM_PROMPT),
-      ...state.messages,
-    ]);
+    const response = await withRetry(
+      () => model.invoke([new SystemMessage(SYSTEM_PROMPT), ...state.messages]),
+      2
+    );
 
-    return {
-      messages: [response],
-      llmCalls: 1,
-    };
+    return { messages: [response], llmCalls: 1 };
   };
 
-  // Clarification route: ask one concise question for missing required details.
+  // Focuses the AI to ask exactly one clarification question.
   const clarifyNode = async (state) => {
-    const response = await model.invoke([
-      new SystemMessage(
-        "You are an AI To-Do assistant. Ask exactly one concise clarification question to gather missing required details before performing the request. Do not execute actions."
-      ),
-      ...state.messages,
-    ]);
+    const response = await withRetry(
+      () => model.invoke([
+        new SystemMessage(
+          "Ask exactly one concise clarification question to gather missing required details before performing the request."
+        ),
+        ...state.messages,
+      ]),
+      2
+    );
 
-    return {
-      messages: [response],
-      llmCalls: 1,
-    };
+    return { messages: [response], llmCalls: 1 };
   };
 
+  // The main logic node for complex reasoning, tool usage determination, and response building
   const llmCall = async (state) => {
     const reflectionFeedback = state.reflection;
     const hasFeedback =
@@ -424,105 +474,145 @@ const buildAgent = async (userId) => {
       && typeof reflectionFeedback.feedback === "string"
       && reflectionFeedback.feedback.trim().length;
 
-    const promptMessages = [new SystemMessage(SYSTEM_PROMPT), ...state.messages];
+    const selectedMessages = selectContextMessages({
+      messages: state.messages,
+      HumanMessage,
+      AIMessage,
+      ToolMessage,
+      maxMessages: MAX_MESSAGES,
+    });
+
+    const summary = summarizeOlderMessages(state.messages, MAX_MESSAGES);
+
+    const promptMessages = [new SystemMessage(SYSTEM_PROMPT)];
+    if (summary) {
+      promptMessages.push(new SystemMessage(summary));
+    }
+    promptMessages.push(...selectedMessages);
 
     if (hasFeedback) {
       promptMessages.push(
         new SystemMessage(
-          "You are revising your previous answer based on critic feedback. Improve correctness, completeness, and clarity. Keep the response concise and user-friendly."
+          "Revise your previous answer using critic feedback. Improve correctness and keep it concise."
         ),
-        new HumanMessage(
-          `Critic feedback: ${reflectionFeedback.feedback}\n\nPlease improve your previous response accordingly.`
-        )
+        new HumanMessage(`Critic feedback: ${reflectionFeedback.feedback}`)
       );
     }
 
-    const response = await modelWithTools.invoke(promptMessages);
+    const response = await withRetry(() => modelWithTools.invoke(promptMessages), 2);
 
     return {
       messages: [response],
       llmCalls: 1,
       reflection: null,
       reflectionParseFailed: false,
+      stopAfterTool: false,
+      toolOutputText: "",
     };
   };
 
+  // Invokes actual CRUD tools safely and formats their output to the LLM.
   const toolNode = async (state) => {
     const lastMessage = state.messages.at(-1);
 
     if (!lastMessage || !AIMessage.isInstance(lastMessage)) {
-      return { messages: [] };
+      return { messages: [], stopAfterTool: false, toolOutputText: "" };
     }
 
-    const result = [];
+    const resultMessages = [];
+    const formattedParts = [];
+    let hasUnknownTool = false;
+    let hasError = false;
 
     for (const toolCall of lastMessage.tool_calls ?? []) {
       const selectedTool = toolsByName[toolCall.name];
 
       if (!selectedTool) {
+        hasUnknownTool = true;
+        hasError = true;
+        const strictError = {
+          error: `Unknown tool call '${toolCall.name}'. Allowed: ${Object.keys(toolsByName).join(", ")}`,
+        };
+        resultMessages.push(
+          new ToolMessage({
+            content: JSON.stringify(strictError),
+            tool_call_id: toolCall.id,
+          })
+        );
+        formattedParts.push(formatToolResult({ toolName: toolCall.name, observation: strictError }));
         continue;
       }
 
-      try {
-        const observation = await selectedTool.invoke(toolCall.args || {});
-        const toolMessage = new ToolMessage({
+      const observation = await withSafeFallback(
+        async () => selectedTool.invoke(toolCall.args || {}),
+        { error: "Tool execution failed." },
+        { toolName: toolCall.name }
+      );
+
+      if (observation?.error) {
+        hasError = true;
+      }
+
+      resultMessages.push(
+        new ToolMessage({
           content: JSON.stringify(observation),
           tool_call_id: toolCall.id,
-        });
-        result.push(toolMessage);
-      } catch (toolError) {
-        const errorToolMessage = new ToolMessage({
-          content: JSON.stringify({ error: toolError.message }),
-          tool_call_id: toolCall.id,
-        });
-        result.push(errorToolMessage);
-      }
+        })
+      );
+      formattedParts.push(formatToolResult({ toolName: toolCall.name, observation }));
     }
 
-    return { messages: result };
+    const canEarlyExit = state.route === "tool" && !hasError && !hasUnknownTool && formattedParts.length > 0;
+
+    return {
+      messages: resultMessages,
+      stopAfterTool: canEarlyExit,
+      toolOutputText: formattedParts.join("\n"),
+    };
+  };
+
+  const toolRoute = (state) => {
+    if (state.stopAfterTool) return "toolResponseNode";
+    return "llmCall";
+  };
+
+  const toolResponseNode = async (state) => {
+    const text = state.toolOutputText?.trim() || "Done.";
+    return {
+      messages: [new AIMessage({ content: text })],
+      stopAfterTool: false,
+      toolOutputText: "",
+    };
   };
 
   const shouldContinue = (state) => {
     const lastMessage = state.messages.at(-1);
-
-    if (!lastMessage || !AIMessage.isInstance(lastMessage)) {
-      return END;
-    }
-
-    if (lastMessage.tool_calls?.length) {
-      return "toolNode";
-    }
-
-    if (state.route === "tool") {
-      return "reflectorNode";
-    }
-
+    if (!lastMessage || !AIMessage.isInstance(lastMessage)) return END;
+    if (lastMessage.tool_calls?.length) return "toolNode";
     return "reflectorNode";
   };
 
+  // A critic node identifying mistakes or lack of conciseness to force LLM revision.
   const reflectorNode = async (state) => {
     const lastMessage = state.messages.at(-1);
 
     if (!lastMessage || !AIMessage.isInstance(lastMessage)) {
-      return {
-        reflection: { isGood: true, feedback: "No assistant output to reflect." },
-      };
+      return { reflection: { isGood: true, feedback: "No assistant output to reflect." } };
     }
 
     if (shouldSkipReflection(lastMessage.content)) {
-      return {
-        reflection: { isGood: true, feedback: "Reflection skipped for simple response." },
-      };
+      return { reflection: { isGood: true, feedback: "Reflection skipped for simple response." } };
     }
 
-    const criticResponse = await model.invoke([
-      new SystemMessage(
-        "You are a strict AI critic. Evaluate the assistant's last response for correctness, completeness, and clarity. Return STRICT JSON only: {\"isGood\": true/false, \"feedback\": \"string\"}. Do not include markdown or extra text."
-      ),
-      new HumanMessage(
-        `Assistant response to evaluate:\n${normalizeText(lastMessage.content)}`
-      ),
-    ]);
+    const criticResponse = await withRetry(
+      () => model.invoke([
+        new SystemMessage(
+          "You are a strict AI critic. Return STRICT JSON only: {\"isGood\": true/false, \"feedback\": \"string\"}."
+        ),
+        new HumanMessage(`Assistant response to evaluate:\n${normalizeText(lastMessage.content)}`),
+      ]),
+      2
+    );
 
     const parsedReflection = parseReflectionJson(criticResponse?.content);
 
@@ -532,35 +622,28 @@ const buildAgent = async (userId) => {
         reflectionParseFailed: true,
       };
     }
-
+    
     return {
       reflection: parsedReflection,
-      retryCount: parsedReflection.isGood ? 0 : 1,
+      retryCount: parsedReflection.isGood ? state.retryCount : state.retryCount + 1,
     };
   };
 
   const shouldRetry = (state) => {
-    if (state.reflectionParseFailed) {
-      return END;
-    }
-
-    if (!state.reflection || state.reflection.isGood) {
-      return END;
-    }
-
-    if (state.retryCount >= MAX_RETRIES) {
-      return END;
-    }
-
+    if (state.reflectionParseFailed) return END;
+    if (!state.reflection || state.reflection.isGood) return END;
+    if (state.retryCount >= MAX_RETRIES) return END;
     return "llmCall";
   };
 
+  // Full complex LangGraph structure combining intention routing, execution, and reflexion.
   const agent = new StateGraph(MessagesState)
     .addNode("decisionNode", decisionNode)
     .addNode("directNode", directNode)
     .addNode("clarifyNode", clarifyNode)
     .addNode("llmCall", llmCall)
     .addNode("toolNode", toolNode)
+    .addNode("toolResponseNode", toolResponseNode)
     .addNode("reflectorNode", reflectorNode)
     .addEdge(START, "decisionNode")
     .addConditionalEdges("decisionNode", routeFromDecision, [
@@ -571,43 +654,49 @@ const buildAgent = async (userId) => {
     .addEdge("directNode", END)
     .addEdge("clarifyNode", END)
     .addConditionalEdges("llmCall", shouldContinue, ["toolNode", "reflectorNode", END])
-    .addEdge("toolNode", "llmCall")
+    .addConditionalEdges("toolNode", toolRoute, ["toolResponseNode", "llmCall"])
+    .addEdge("toolResponseNode", END)
     .addConditionalEdges("reflectorNode", shouldRetry, ["llmCall", END])
-    .compile({ checkpointer: new MemorySaver() });
+    .compile({ checkpointer: globalCheckpointer });
 
   return {
     run: async (command, options = {}) => {
-      const {
-        sessionId,
-        threadId,
-        resetMemory = false,
-      } = options;
+      const traceId = options.traceId || randomUUID();
+      let effectiveThreadId = resolveThreadId(userId, options);
+      const requestLogger = logger.child({ traceId, userId: String(userId), threadId: effectiveThreadId });
 
-      const resolvedThreadId = threadId
-        || (sessionId ? `${String(userId)}:${String(sessionId)}` : String(userId));
-      const effectiveThreadId = resetMemory
-        ? `${resolvedThreadId}:${Date.now()}`
-        : resolvedThreadId;
+      requestLogger.info({ commandPreview: String(command).slice(0, 120) }, "Agent request started");
 
-      const invokeAgent = async (threadIdToUse) => {
-        return agent.invoke(
-          {
-            messages: [new HumanMessage(command)],
+      await withSafeFallback(
+        async () => chatHistoryService.saveMessage({
+          userId: String(userId),
+          threadId: effectiveThreadId,
+          role: 1,
+          message: String(command),
+        }),
+        null,
+        { traceId, stage: "save_user_message" }
+      );
+
+      const invokeAgent = async (threadIdToUse) => agent.invoke(
+        {
+          messages: [new HumanMessage(command)],
+        },
+        {
+          configurable: {
+            thread_id: String(threadIdToUse),
+            user_id: String(userId),
           },
-          {
-            configurable: {
-              thread_id: threadIdToUse,
-            },
-            runName: "todo-ai-langgraph-agent",
-            tags: ["todo-ai", "langgraph", "agent-command"],
-            metadata: {
-              userId: String(userId),
-              threadId: threadIdToUse,
-              endpoint: "/api/v1/agent/command/langgraph",
-            },
-          }
-        );
-      };
+          runName: "todo-ai-langgraph-agent",
+          tags: ["todo-ai", "langgraph", "agent-command"],
+          metadata: {
+            traceId,
+            userId: String(userId),
+            threadId: String(threadIdToUse),
+            endpoint: "/api/v1/agent/command/langgraph",
+          },
+        }
+      );
 
       let result;
 
@@ -620,10 +709,27 @@ const buildAgent = async (userId) => {
           && errorMessage.includes("content[0].type");
 
         if (!hasCorruptedHistoryShape) {
-          throw error;
+          requestLogger.error({ error: errorMessage }, "Agent invocation failed");
+          return {
+            output: "I couldn’t process that request right now. Please try again.",
+            trace: [],
+          };
         }
 
         const recoveredThreadId = `${String(userId)}:recovered:${Date.now()}`;
+        effectiveThreadId = recoveredThreadId;
+
+        await withSafeFallback(
+          async () => chatHistoryService.saveMessage({
+            userId: String(userId),
+            threadId: effectiveThreadId,
+            role: 1,
+            message: String(command),
+          }),
+          null,
+          { traceId, stage: "save_recovered_user_message" }
+        );
+
         result = await invokeAgent(recoveredThreadId);
       }
 
@@ -649,6 +755,19 @@ const buildAgent = async (userId) => {
         }
       }
 
+      await withSafeFallback(
+        async () => chatHistoryService.saveMessage({
+          userId: String(userId),
+          threadId: effectiveThreadId,
+          role: 2,
+          message: output,
+        }),
+        null,
+        { traceId, stage: "save_assistant_message" }
+      );
+
+      requestLogger.info({ llmCalls: result.llmCalls }, "Agent request completed");
+
       return {
         output,
         trace: result.messages,
@@ -658,7 +777,8 @@ const buildAgent = async (userId) => {
 };
 
 exports.runLangGraphAgent = async (userMessage, userId, options = {}) => {
-  const cacheKey = String(userId);
+  const sessionScope = options.sessionId || options.threadId || "default";
+  const cacheKey = `${String(userId)}:${String(sessionScope)}`;
   let agent = userAgentCache.get(cacheKey);
 
   if (!agent) {
@@ -670,6 +790,16 @@ exports.runLangGraphAgent = async (userMessage, userId, options = {}) => {
 };
 
 exports.clearLangGraphMemory = (userId) => {
-  const cacheKey = String(userId);
-  return userAgentCache.delete(cacheKey);
+  const prefix = `${String(userId)}:`;
+  let deleted = false;
+
+  for (const key of userAgentCache.keys()) {
+    if (String(key).startsWith(prefix)) {
+      userAgentCache.delete(key);
+      deleted = true;
+    }
+  }
+
+  toolCache.clearUser(userId);
+  return deleted;
 };

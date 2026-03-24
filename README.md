@@ -25,7 +25,17 @@ A full-fledged TODO application built with **Node.js**, **Express.js**, and **Mo
 - ✅ Star/favorite todos
 - ✅ Todo statistics and analytics
 
-### API Features
+### Understanding the Agentic Flow
+
+The AI Agent uses LangGraph to orchestrate a reasoning loop where an LLM decides whether to use tools, ask for clarification, or respond directly to the user. It utilizes checkpointers for memory, reflexion (self-correction) to improve outputs, and various tools to interact with the Todo application database.
+
+### The LangGraph Flow:
+1. **Decision Node**: Determines the intent of the user request (Direct conversation, clarification, tool execution, or full reasoning tasks).
+2. **Tool Execution**: Safe execution of predefined tools (create, update, read, delete).
+3. **Reflexion Node**: Evaluates the assistant's responses for correctness and conciseness, requesting retries if the response is flawed.
+4. **LLM Synthesis**: Generates the final user-facing response with full context.
+
+## API Features
 - ✅ RESTful API design
 - ✅ JWT-based authentication
 - ✅ Swagger API documentation
