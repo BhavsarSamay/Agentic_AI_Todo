@@ -389,7 +389,16 @@ const buildAgent = async (userId) => {
     return /^(ok|okay|done|sure|got it|completed|updated|deleted|created)[.!]?$/i.test(text);
   };
 
-  // Evaluates user intent to route them appropriately without invoking the full model.
+  /**
+   * The Decision Node acts as an intent router in the LangGraph chain.
+   * It analyzes the user input locally using basic RegExp, 
+   * or a fast, single-invocation LLM call to classify the intent.
+   * Based on intent ("direct", "tool", "clarify", "full"), it sets graph execution logic limits,
+   * bypassing full LLM tool reasoning cycles for simple queries.
+   * 
+   * @param {Object} state LangGraph messages and retry scopes
+   * @returns {Object} Adjusted state denoting chosen `route` mode
+   */
   const decisionNode = async (state) => {
     const latestQuery = getLatestHumanInput(state.messages);
     const normalizedQuery = latestQuery.trim();
@@ -440,7 +449,14 @@ const buildAgent = async (userId) => {
     return "llmCall";
   };
 
-  // Provides a fast direct response for simple conversational queries without specific tools.
+  /**
+   * The Direct Node intercepts basic conversations and returns immediate, 
+   * LLM-generated conversational output without inspecting available CRUD tools.
+   * Useful for "hello" / "goodbye" queries to keep execution cost optimal.
+   * 
+   * @param {Object} state Expected to have simple unstructured user input
+   * @returns {Object} Directly appended AIMessage ignoring tools processing
+   */
   const directNode = async (state) => {
     const response = await withRetry(
       () => model.invoke([new SystemMessage(SYSTEM_PROMPT), ...state.messages]),
@@ -450,7 +466,14 @@ const buildAgent = async (userId) => {
     return { messages: [response], llmCalls: 1 };
   };
 
-  // Focuses the AI to ask exactly one clarification question.
+  /**
+   * The Clarify Node intentionally limits the AI processing capability solely asking the user
+   * a single necessary follow up question before initiating execution. 
+   * This is helpful for ambiguous queries missing required data objects.
+   * 
+   * @param {Object} state Expected to lack required CRUD info inputs
+   * @returns {Object} Follow-up conversational AI response prompting clarification
+   */
   const clarifyNode = async (state) => {
     const response = await withRetry(
       () => model.invoke([
@@ -465,7 +488,15 @@ const buildAgent = async (userId) => {
     return { messages: [response], llmCalls: 1 };
   };
 
-  // The main logic node for complex reasoning, tool usage determination, and response building
+  /**
+   * Main complex reasoning and AI invocation Node utilizing OpenAI bound with tools.
+   * Compiles summarized conversation history ensuring optimal context size.
+   * Handles re-evaluating the feedback object from internal Critic `reflectorNode`
+   * and subsequently prompting the main LLM to revise errors.
+   * 
+   * @param {Object} state LangGraph messages history including reflexion feedback
+   * @returns {Object} Response object containing populated AIMessages, Tool Calls and state syncs
+   */
   const llmCall = async (state) => {
     const reflectionFeedback = state.reflection;
     const hasFeedback =
@@ -511,7 +542,15 @@ const buildAgent = async (userId) => {
     };
   };
 
-  // Invokes actual CRUD tools safely and formats their output to the LLM.
+  /**
+   * Action executing toolNode handles safe execution of functions requested.
+   * Isolates error boundaries, ensuring missing/broken tools return context stringified natively, 
+   * enabling `llmCall` subsequent reflection capabilities without halting execution.
+   * If intent route restricts deep traversal, `stopAfterTool` flags the final stage node.
+   * 
+   * @param {Object} state Pre-populated state where the most recent AIMessage has tool_calls
+   * @returns {Object} ToolMessages appended encapsulating successful or errored API operation contexts
+   */
   const toolNode = async (state) => {
     const lastMessage = state.messages.at(-1);
 
@@ -592,7 +631,14 @@ const buildAgent = async (userId) => {
     return "reflectorNode";
   };
 
-  // A critic node identifying mistakes or lack of conciseness to force LLM revision.
+  /**
+   * Reflector Critic Node. Takes the previously calculated unstructured response of AIMessage 
+   * and provides rigorous programmatic critique. Re-prompts the core logic node (`llmCall`) 
+   * upon identifying hallucinated data, lacking conciseness, or poorly formatted objects.
+   * 
+   * @param {Object} state Recent state objects evaluated from user facing perspective
+   * @returns {Object} JSON formatted reflexion metadata with pass/fail boolean flag and textual feedback reason
+   */
   const reflectorNode = async (state) => {
     const lastMessage = state.messages.at(-1);
 
@@ -636,7 +682,12 @@ const buildAgent = async (userId) => {
     return "llmCall";
   };
 
-  // Full complex LangGraph structure combining intention routing, execution, and reflexion.
+  /**
+   * Final assembled StateGraph configuring explicit conditional edges defining execution patterns.
+   * `decisionNode` maps route outcomes into `directNode`, `clarifyNode`, or `llmCall`.
+   * Feedback reflection iterates between `reflectorNode` and `llmCall` optimizing correctness before exiting graph.
+   * Global memory enables asynchronous checkpointers synchronization.
+   */
   const agent = new StateGraph(MessagesState)
     .addNode("decisionNode", decisionNode)
     .addNode("directNode", directNode)

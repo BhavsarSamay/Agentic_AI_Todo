@@ -230,7 +230,14 @@ const buildAgent = async (userId) => {
     }),
   });
 
-  // Node to prompt the LLM to process messages and return the next response
+    /**
+   * The primary Language Model (LLM) Node in the LangGraph chain.
+   * Invokes the chosen OpenAI model, passing system and user messages.
+   * The state is updated, appending the new AIMessage to messages.
+   * 
+   * @param {Object} state The LangGraph state schema containing message history
+   * @returns {Object} Updated message history with new AIMessage and llmCalls incremented
+   */
   const llmCall = async (state) => {
     const response = await modelWithTools.invoke([
       new SystemMessage(SYSTEM_PROMPT),
@@ -243,7 +250,14 @@ const buildAgent = async (userId) => {
     };
   };
 
-  // Node to safely execute user requested tools and return results mapped to tool context
+    /**
+   * Executes tools requested by the LLM securely within the LangGraph graph.
+   * Looks up the corresponding local CRUD functions, invokes them, 
+   * and returns the context formatted as a ToolMessage list.
+   * 
+   * @param {Object} state Expected to have at least one AIMessage with `tool_calls`
+   * @returns {Object} List of ToolMessage instances denoting JSON results
+   */
   const toolNode = async (state) => {
     const lastMessage = state.messages.at(-1);
 
@@ -279,7 +293,14 @@ const buildAgent = async (userId) => {
     return { messages: result };
   };
 
-  // Edge condition that determines if we need to call tool-node or end flow
+    /**
+   * Evaluates the active state to decide the next hop in the graph.
+   * If the LLM returned tool calls, it routes execution to 'toolNode'.
+   * Otherwise, the assistant sequence is complete, returning END.
+   * 
+   * @param {Object} state The LangGraph state schema
+   * @returns {string} The name of the next node or END
+   */
   const shouldContinue = (state) => {
     const lastMessage = state.messages.at(-1);
 
@@ -294,7 +315,11 @@ const buildAgent = async (userId) => {
     return END;
   };
 
-  // Compiling the LangGraph StateMachine describing how different nodes connect via edges
+    /**
+   * Final structure combining LLM and Tools nodes via defined logic loops.
+   * `START` calls `llmCall`, which conditionally calls `toolNode`, bouncing back to `llmCall` until the LLM stops calling tools `END`.
+   * It also attaches MemorySaver enabling state preservation within execution scopes.
+   */
   const agent = new StateGraph(MessagesState)
     .addNode("llmCall", llmCall)
     .addNode("toolNode", toolNode)
