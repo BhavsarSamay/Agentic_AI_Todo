@@ -2,7 +2,7 @@
 
 ## ✅ Project Completion Status: 100%
 
-This is a complete, production-ready TODO application built with the same structure as the Asahi node-api project.
+This is a complete, production-ready TODO application.
 
 ---
 
